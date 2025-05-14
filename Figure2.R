@@ -246,7 +246,7 @@ ggsave(filename = file.path(path, 'macrophage_go_terms.pdf'),
        scale = 0.5, width = 34, height = 20, units='cm')
 
 
-# Figure 2f - Macrophage dotplot of enriched GO terms
+# Figure 2g - Macrophage heatmap of selected genes
 # Extract count matrix
 matrix <- as.data.frame(assay(vsd))
 matrix$gene_id <- sub("\\..*", "", rownames(matrix))
@@ -261,8 +261,8 @@ matrix$gene_id <- NULL
 colnames(matrix) <- sub('\\.', '-', colnames(matrix))
 
 # Prepare plot
-genes <- c('MERTK', 'CABLES1', 'CDKN1C', 'PDK4', 'ADAMTS15', 'MS4A6A', 'CEACAM4', 'THBS1', 'THBS1-IT1',
-           'CCL1', 'CCL2', 'CCL3', 'CCL3L3', 'CCL4', 'CCL8', 'CD274', 'CXCL9', 'CXCL10', 
+genes <- c('MERTK', 'CD163', 'CABLES1', 'CDKN1C', 'PDK4', 'ADAMTS15', 'MS4A6A', 'CEACAM4', 'THBS1', 'THBS1-IT1',
+           'CD80', 'VCAM1', 'ICAM1', 'IRF8', 'CD83', 'CD58', 'CD44', 'CCL1', 'CCL2', 'CCL3', 'CCL3L3', 'CCL4', 'CCL8', 'CD274', 'CXCL9', 'CXCL10', 
            'IL1B', 'IL6', 'IL12B', 'IL17A', 'IL17F', 'TNF', 'TNFSF15', 'TNFRSF4',
            'TGFB1', 'CSF2', 'CLEC5A', 'EDN1', 'HSD11B1', 'SERPINE1', 'SIMALR')
 
@@ -285,10 +285,10 @@ pheatmap(matrix_subset, cluster_rows=F, cluster_cols=F, show_rownames=T, show_co
          fontsize_row=12, 
          annotation_colors = annotation_colors,
          labels_row = parse(text = paste0("italic('", rownames(matrix_subset), "')")),
-         gaps_col = 5, gaps_row = 9)
+         gaps_col = 5, gaps_row = 10)
 
 
-# Figure 2g - Projection of bulk signature onto sn data
+# Figure 2h - Projection of bulk signature onto sn data
 # Score signature
 resLFC_subset <- resLFC[resLFC$log2FoldChange<(-0.5) & resLFC$padj<0.05,]
 multiome_mac <- AddModuleScore_UCell(multiome_mac, features = list('upregulated'= resLFC_subset$hgnc_symbol),
@@ -316,4 +316,18 @@ DotPlot(multiome_mac,
 
 ggsave(filename = file.path(path, 'dotplot_mertk.pdf'),
        scale = 0.5, width = 8, height = 14, units='cm')
+
+
+
+DotPlot(multiome_mac, 
+        features = c('CD36', 'LYVE1', 'RNASE1', 'NFKBIZ', 'CCL8', 'F13A1', 'CCL2', 'CD80',
+                     'MAF', 'CD209', 'MRC1', 'CXCL10', 'CCL4', 'CD274', 'CXCL9', 'IRF1', 'NFKB1', 'CCL21', 
+                     'ICAM1', 'CCL3', 'CD44', 'CD58', 'VCAM1', 'IL1B', 'CD83', 'IRF8', 'APOE', 'SELENOP', 
+                     'CD163', 'CD38', 'MMP9', 'CXCL12', 'PLAU', 'C1QA', 'MERTK'), 
+        scale.min = 0, 
+        cols = c('grey90', 'navy')) + 
+  NoLegend() + 
+  RotatedAxis() +
+  scale_x_discrete(labels = function(x) parse(text = paste0("italic('", x, "')")))
+
 

@@ -395,8 +395,6 @@ options(future.globals.maxSize = 6000 * 1024^2)
 cellchat <- identifyOverExpressedGenes(cellchat, min.cells=3)
 cellchat <- identifyOverExpressedInteractions(cellchat)
 cellchat <- smoothData(cellchat, adj = PPI.human)
-
-computeAveExpr(cellchat, features = c("TNF","CXCL1"), type =  "truncatedMean", trim = 0.005)
 cellchat <- computeCommunProb(cellchat, raw.use=F, population.size=F, type = "truncatedMean", trim = 0.005)
 
 
