@@ -1,333 +1,394 @@
-library(Seurat)
-library(Signac)
-library(SeuratObject)
-library(SeuratDisk)
-library(SeuratWrappers)
-library(scCustomize)
-library(UCell)
-library(harmony)
-library(CellChat)
-library(destiny)
-library(DESeq2)
-library(clusterProfiler)
-library(EnhancedVolcano)
-library(ggplot2)
-library(ggsci)
-library(destiny)
-library(scales)
-library(viridis)
-library(nichenetr)
-library(biomaRt)
-library(pheatmap)
-library(RColorBrewer)
-library(org.Hs.eg.db)
+# ==============================================================================
+# Figure 2
+#   A  Macrophage UMAP, coloured by polarisation state
+#   B  State proportions in normal vs UUO kidney (pie charts)
+#   C  GO-term pathway scores per state
+#   D  Marker-gene dot plot per state
+#   F  GO enrichment of genes induced by SC CM (bulk RNA-seq of macrophages)
+#   G  Heatmap of selected genes (bulk RNA-seq)
+#   H  Bulk-derived signature projected onto the single-nucleus macrophages
+# ==============================================================================
 
-multiome <- readRDS('/Users/maximilianreck/Drive/Datasets/seurat_object_multiome.rds')
-#-------------------------------------------------------------------------------
 
-# Figure 2a - Macrophage diffusion map
-# Extract macrophages and pre-process
-multiome_mac <- subset(multiome_myeloid, subset=CellType=='Macrophage')
-multiome_mac <- subset(multiome_mac, subset=Cluster%in%c('6'), invert=T)
+# ------------------------------------------------------------------------------
+# Libraries
+# ------------------------------------------------------------------------------
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(harmony)
+  library(UCell)
+  library(DESeq2)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(ggplot2)
+  library(patchwork)
+  library(pheatmap)
+  library(RColorBrewer)
+})
 
-multiome_mac <- CreateSeuratObject(counts = multiome_mac@assays$RNA@counts, meta.data = multiome_mac@meta.data)
+set.seed(1)
+
+# ------------------------------------------------------------------------------
+# Paths and settings
+# ------------------------------------------------------------------------------
+data_dir             <- #directory with supplementary data
+path_myeloid_rds     <- file.path(data_dir, "myeloid_data.rds")
+path_go_terms_rds    <- file.path(data_dir, "go_terms.rds")
+path_mac_bulk_counts <- file.path(data_dir, "mac_bulkRNA_counts.csv")
+
+outdir <- path.expand("~/Desktop/out/fig2")
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+n_cores <- 10  # UCell parallelism
+
+# Plot helper
+save_plot <- function(plot, file, width, height) {
+  ggsave(file.path(outdir, file), plot = plot,
+         width = width, height = height, units = "cm")
+}
+
+# Helper: italic gene labels for ggplot axes and pheatmap
+italic_labels <- function(x) parse(text = paste0("italic('", x, "')"))
+
+
+# ------------------------------------------------------------------------------
+# Colours
+# ------------------------------------------------------------------------------
+# Convert an HSV colour (3x1 matrix: h, s, v, each in 0-1) to RGB (0-1)
+hsv2rgb <- function(x) {
+  h <- x[1, 1]
+  s <- x[2, 1]
+  v <- x[3, 1]
+  C <- s * v
+  hdash <- h * 6
+  X <- C * (1 - abs(hdash %% 2 - 1))
+  if (0 <= hdash & hdash <= 1) RGB1 <- c(C, X, 0)
+  if (1 <= hdash & hdash <= 2) RGB1 <- c(X, C, 0)
+  if (2 <= hdash & hdash <= 3) RGB1 <- c(0, C, X)
+  if (3 <= hdash & hdash <= 4) RGB1 <- c(0, X, C)
+  if (4 <= hdash & hdash <= 5) RGB1 <- c(X, 0, C)
+  if (5 <= hdash & hdash <= 6) RGB1 <- c(C, 0, X)
+  RGB1 + (v - C)
+}
+
+# Desaturate a colour: multiply its saturation by p (p = 1 leaves it unchanged,
+# smaller p gives a paler colour)
+pastellize <- function(x, p) {
+  if (is.character(x)) x <- col2rgb(x) / 255
+  if (is.numeric(x))   x <- matrix(x, nrow = 3)
+  col <- rgb2hsv(x, maxColorValue = 1)
+  col[2, 1] <- col[2, 1] * p
+  col <- hsv2rgb(col)
+  rgb(col[1], col[2], col[3])
+}
+
+# Material colour ramps (the same ones used for Figure 1)
+oranges <- pal_material("orange", alpha = 1)(10)
+reds    <- pal_material("red",    alpha = 1)(10)
+indigos <- pal_material("indigo", alpha = 1)(10)
+greens  <- pal_material("green",  alpha = 1)(10)
+
+mac_levels <- c("Phago Mac", "Infl Mac", "Endo Mac", "Res Mac")
+mac_colors <- c(
+  "Phago Mac" = pastellize(oranges[8], 0.5),
+  "Infl Mac"  = pastellize(reds[8],    0.8),
+  "Endo Mac"  = pastellize(indigos[6], 0.8),
+  "Res Mac"   = pastellize(greens[7],  0.8)
+)
+
+
+# ------------------------------------------------------------------------------
+# Gene ID mapping (offline, via org.Hs.eg.db)
+# ------------------------------------------------------------------------------
+annotate_ensembl <- function(ids) {
+  ids <- sub("\\..*", "", ids)  # strip Ensembl version suffix
+  data.frame(
+    gene_id = ids,
+    symbol  = unname(AnnotationDbi::mapIds(org.Hs.eg.db, keys = ids, keytype = "ENSEMBL",
+                                           column = "SYMBOL",   multiVals = "first")),
+    entrez  = unname(AnnotationDbi::mapIds(org.Hs.eg.db, keys = ids, keytype = "ENSEMBL",
+                                           column = "ENTREZID", multiVals = "first")),
+    stringsAsFactors = FALSE
+  )
+}
+
+
+# ==============================================================================
+# Panel A - Macrophage UMAP
+# ==============================================================================
+
+# --- Extract macrophages, drop low-quality cluster 6 (from the myeloid object) ---
+multiome_myeloid <- readRDS(path_myeloid_rds)
+multiome_mac <- subset(multiome_myeloid,
+                       subset = CellType == "Macrophage" & !(Cluster %in% "6"))
+
+# --- Rebuild as a fresh object, then normalise, integrate and embed ---
+multiome_mac <- CreateSeuratObject(
+  counts    = GetAssayData(multiome_mac, assay = "RNA", slot = "counts"),
+  meta.data = multiome_mac@meta.data
+)
 multiome_mac <- SCTransform(multiome_mac, vst.flavor = "v2")
 multiome_mac <- RunPCA(multiome_mac, npcs = 100)
-multiome_mac <- RunHarmony(multiome_mac, group.by.vars='Sex')
-multiome_mac <- RunUMAP(multiome_mac, reduction = 'harmony', dims = c(1:10))
+multiome_mac <- RunHarmony(multiome_mac, group.by.vars = "Sex")
+multiome_mac <- RunUMAP(multiome_mac, reduction = "harmony", dims = 1:30,
+                        min.dist = 0.03, n.neighbors = 20)
 
-pca <- as.data.frame(t(multiome_mac@reductions[["harmony"]]@cell.embeddings))
-colnames(pca) <- multiome_mac$Cluster
+# --- Cluster ---
+multiome_mac <- FindNeighbors(multiome_mac, reduction = "harmony", dims = 1:30)
+multiome_mac <- FindClusters(multiome_mac, algorithm = 1, resolution = 1.3)
 
-# Diffuaion map
-dm <- DiffusionMap(t(pca[1:20,]), k=30, sigma='local', n_local=10, rotate=F)
+# --- Cluster markers, used to inform the manual annotation below ---
+markers <- SeuratWrappers::RunPrestoAll(multiome_mac, only.pos = TRUE)
+write.csv(markers, file.path(outdir, "suppl_macrophage_cluster_markers.csv"), row.names = FALSE)
 
-# Add to Seurat object
-dr <- multiome_mac@reductions[["umap"]]
-dr@cell.embeddings[,1] <- as.numeric(dm$DC1)*100
-dr@cell.embeddings[,2] <- as.numeric(dm$DC2)*100
-dr@cell.embeddings <- cbind(dr@cell.embeddings, as.numeric(dm$DC3)*100)
-colnames(dr@cell.embeddings) <- c('DC_1', 'DC_2', 'DC_3')
-dr@key <- 'DC_'
-multiome_mac@reductions[["DM"]] <- dr
+# --- Manual annotation of clusters into four macrophage states ---
+# Specific to this clustering (resolution 1.3, seed 1); re-check against the
+# marker table if anything upstream changes.
+cluster_to_state <- c(
+  "0" = "Phago Mac", "1" = "Endo Mac", "2" = "Res Mac", "3" = "Endo Mac",
+  "4" = "Phago Mac", "5" = "Endo Mac", "6" = "Res Mac", "7" = "Infl Mac"
+)
+stopifnot("unannotated clusters present" =
+            all(levels(multiome_mac$seurat_clusters) %in% names(cluster_to_state)))
 
-# Cluster
-multiome_mac <- FindNeighbors(multiome_mac, reduction = "harmony", dims = 1:20) %>% FindClusters(algorithm=1, resolution = 1.5)
+multiome_mac$MacState <- factor(
+  unname(cluster_to_state[as.character(multiome_mac$seurat_clusters)]),
+  levels = mac_levels
+)
+Idents(multiome_mac) <- "MacState"
 
-Idents(multiome_mac) <- paste('c', Idents(multiome_mac), sep='')
-multiome_mac <- RenameIdents(object = multiome_mac, `c3` = "D")
-multiome_mac <- RenameIdents(object = multiome_mac, `c10` = "D")
-multiome_mac <- RenameIdents(object = multiome_mac, `c5` = "D")
-multiome_mac <- RenameIdents(object = multiome_mac, `c8` = "D")
-multiome_mac <- RenameIdents(object = multiome_mac, `c0` = "D")
-multiome_mac <- RenameIdents(object = multiome_mac, `c4` = "A")
-multiome_mac <- RenameIdents(object = multiome_mac, `c6` = "A")
-multiome_mac <- RenameIdents(object = multiome_mac, `c1` = "C")
-multiome_mac <- RenameIdents(object = multiome_mac, `c9` = "C")
-multiome_mac <- RenameIdents(object = multiome_mac, `c2` = "C")
-multiome_mac <- RenameIdents(object = multiome_mac, `c7` = "B")
-multiome_mac$Cluster <- Idents(multiome_mac)
-
-# Plot
-Idents(multiome_mac) <- factor(Idents(multiome_mac), levels=(c('A', 'B', 'C', 'D')))
-DimPlot(multiome_mac, reduction='DM', group.by = 'Cluster', dims = c(1, 2), label = F) + 
-  ggtitle('') + NoAxes() + theme_void()
-
-ggsave(filename = file.path(path, 'umap_macrophage.pdf'),
-       scale = 0.5, width = 25, height = 20, units='cm')
+# --- Plot ---
+p_umap <- DimPlot(multiome_mac, group.by = "MacState", cols = mac_colors) +
+  ggtitle("") + theme_void()
+save_plot(p_umap, "fig2A_umap_macrophages.pdf", width = 9, height = 7)
 
 
-# Figure 2b - Macrophage proportions
-# Format data
-multiome_mac_control <- subset(multiome_mac, subset=Condition=='Control')
-multiome_mac_uuo <- subset(multiome_mac, subset=Condition=='UUO')
+# ==============================================================================
+# Panel B - Macrophage state proportions (Control vs UUO)
+# ==============================================================================
 
-control_df <- data.frame(table(multiome_mac_control$Cluster))
-control_df$pct <- control_df$Freq/sum(control_df$Freq)*100
-control_df$Var1 <- factor(control_df$Var1, levels = c('A', 'B', 'C', 'D'))
-uuo_df <- data.frame(table(multiome_mac_uuo$Cluster))
-uuo_df$pct <- uuo_df$Freq/sum(uuo_df$Freq)*100
-uuo_df$Var1 <- factor(uuo_df$Var1, levels = c('A', 'B', 'C', 'D'))
+state_proportions <- function(obj) {
+  df <- as.data.frame(table(obj$MacState))
+  df$pct <- df$Freq / sum(df$Freq) * 100
+  df
+}
 
-# Plot
-ggplot(control_df, aes(x="", y=pct, fill=Var1)) +
-  geom_bar(stat="identity", width=1, color="white") +
-  coord_polar("y", start=0) +
-  theme_void() + scale_fill_manual(values=c('A'='#00BFC4', 'B'='#F8766D', 'C'='#7CAE00', 'D'='#C77CFF'))
+plot_pie <- function(df, title) {
+  ggplot(df, aes(x = "", y = pct, fill = Var1)) +
+    geom_bar(stat = "identity", width = 1, color = "white") +
+    coord_polar("y", start = 0) +
+    scale_fill_manual(values = mac_colors, name = NULL) +
+    ggtitle(title) +
+    theme_void() +
+    theme(plot.title = element_text(hjust = 0.5))
+}
 
-ggsave(filename = file.path(path, 'pie_control.pdf'),
-       scale = 0.5, width = 20, height = 15, units='cm')
+p_pie_control <- plot_pie(state_proportions(subset(multiome_mac, subset = Condition == "Control")),
+                          "Normal kidney")
+p_pie_uuo     <- plot_pie(state_proportions(subset(multiome_mac, subset = Condition == "UUO")),
+                          "UUO kidney")
 
-ggplot(uuo_df, aes(x="", y=pct, fill=Var1)) +
-  geom_bar(stat="identity", width=1, color="white") +
-  coord_polar("y", start=0) +
-  theme_void() + scale_fill_manual(values=c('A'='#00BFC4', 'B'='#F8766D', 'C'='#7CAE00', 'D'='#C77CFF'))
-
-ggsave(filename = file.path(path, 'pie_uuo.pdf'),
-       scale = 0.5, width = 20, height = 15, units='cm')
-
-
-# Figure 2c - Macrophage pathway scores
-go_terms <- readRDS(file.path(path, 'go_terms.rds'))
-
-# Add scores for terms of interest
-pw_genes <- genes <- bitr(unname(unlist(go_terms['GO:0019221'])), fromType = "ENTREZID", toType = "SYMBOL", OrgDb='org.Hs.eg.db')
-multiome_mac <- AddModuleScore_UCell(multiome_mac, features = list(cytokine=pw_genes$SYMBOL)) 
-pw_genes <- genes <- bitr(unname(unlist(go_terms['GO:0034341'])), fromType = "ENTREZID", toType = "SYMBOL", OrgDb='org.Hs.eg.db')
-multiome_mac <- AddModuleScore_UCell(multiome_mac, features = list(IFNG=pw_genes$SYMBOL)) 
-multiome_mac@meta.data['response to type II interferon'] <- multiome_mac$IFNG_UCell
-
-pw_genes <- genes <- bitr(unname(unlist(go_terms['GO:0034612'])), fromType = "ENTREZID", toType = "SYMBOL", OrgDb='org.Hs.eg.db')
-multiome_mac <- AddModuleScore_UCell(multiome_mac, features = list(TNF=pw_genes$SYMBOL)) 
-multiome_mac@meta.data['response to tumor necrosis factor'] <- multiome_mac$TNF_UCell
-
-pw_genes <- genes <- bitr(unname(unlist(go_terms['GO:0006898'])), fromType = "ENTREZID", toType = "SYMBOL", OrgDb='org.Hs.eg.db')
-multiome_mac <- AddModuleScore_UCell(multiome_mac, features = list(endocytosis=pw_genes$SYMBOL)) 
-multiome_mac@meta.data['receptor-mediated endocytosis'] <- multiome_mac$endocytosis_UCell
-
-pw_genes <- genes <- bitr(unname(unlist(go_terms['GO:0006910'])), fromType = "ENTREZID", toType = "SYMBOL", OrgDb='org.Hs.eg.db')
-multiome_mac <- AddModuleScore_UCell(multiome_mac, features = list(phago=pw_genes$SYMBOL)) 
-multiome_mac@meta.data['phagocytosis, recognition'] <- multiome_mac$phago_UCell
-
-pw_genes <- genes <- bitr(unname(unlist(go_terms['GO:0090130'])), fromType = "ENTREZID", toType = "SYMBOL", OrgDb='org.Hs.eg.db')
-multiome_mac <- AddModuleScore_UCell(multiome_mac, features = list(migration=pw_genes$SYMBOL)) 
-multiome_mac@meta.data['tissue migration'] <- multiome_mac$migration_UCell
-
-pw_genes <- genes <- bitr(unname(unlist(go_terms['GO:0021700'])), fromType = "ENTREZID", toType = "SYMBOL", OrgDb='org.Hs.eg.db')
-multiome_mac <- AddModuleScore_UCell(multiome_mac, features = list(development=pw_genes$SYMBOL)) 
-multiome_mac@meta.data['developmental maturation'] <- multiome_mac$development_UCell
-
-pw_genes <- genes <- bitr(unname(unlist(go_terms['GO:0019882'])), fromType = "ENTREZID", toType = "SYMBOL", OrgDb='org.Hs.eg.db')
-multiome_mac <- AddModuleScore_UCell(multiome_mac, features = list(antigen=pw_genes$SYMBOL)) 
-multiome_mac@meta.data['antigen processing and presentation'] <- multiome_mac$antigen_UCell
-
-pw_genes <- genes <- bitr(unname(unlist(go_terms['GO:0019915'])), fromType = "ENTREZID", toType = "SYMBOL", OrgDb='org.Hs.eg.db')
-multiome_mac <- AddModuleScore_UCell(multiome_mac, features = list(lipid=pw_genes$SYMBOL)) 
-
-# Plot
-DotPlot_scCustom(seurat_object = multiome_mac, 
-                 features=rev(c('phagocytosis, recognition', 'receptor-mediated endocytosis', 'antigen processing and presentation', 'tissue migration',
-                                'developmental maturation', 'response to tumor necrosis factor', 'response to type II interferon')), 
-                 flip_axes = T, scale.min = 0, scale.max=50) + scale_color_viridis() + NoLegend()
-
-ggsave(filename = file.path(path, 'macrophage_pathways.pdf'),
-       scale = 0.5, width = 20, height = 20, units='cm')
+p_pies <- (p_pie_control / p_pie_uuo) + plot_layout(guides = "collect")  # one shared legend
+save_plot(p_pies, "fig2B_pies_state_proportions.pdf", width = 11, height = 12)
 
 
-# Figure 2d - Macrophage genes dotplot
-DotPlot(multiome_mac, 
-        features = rev(c('CCL2', 'CCL3', 'CCL4', 'CCL8', 'CD274', 'CXCL9', 'CXCL10', 'IL1B', 'TNFRSF4')), 
-        scale.min = 0, 
-        cols = c('grey90', 'navy')) + 
+# ==============================================================================
+# Panel C - Macrophage pathway scores (GO terms)
+# ==============================================================================
+
+# GO term -> label shown on the plot, in top-to-bottom plotting order
+go_sets <- c(
+  "GO:0006910" = "phagocytosis, recognition",
+  "GO:0006898" = "receptor-mediated endocytosis",
+  "GO:0019882" = "antigen processing and presentation",
+  "GO:0090130" = "tissue migration",
+  "GO:0021700" = "developmental maturation",
+  "GO:0034612" = "response to tumor necrosis factor",
+  "GO:0034341" = "response to type II interferon"
+)
+
+go_terms <- readRDS(path_go_terms_rds)  # list: GO ID -> Entrez IDs
+
+go_symbols <- lapply(names(go_sets), function(go_id) {
+  entrez  <- as.character(unname(unlist(go_terms[go_id])))
+  symbols <- AnnotationDbi::mapIds(org.Hs.eg.db, keys = entrez, keytype = "ENTREZID",
+                                   column = "SYMBOL", multiVals = "first")
+  unique(stats::na.omit(unname(symbols)))
+})
+names(go_symbols) <- sub(":", "_", names(go_sets))  # safe feature names for UCell
+stopifnot(all(lengths(go_symbols) > 0))
+
+multiome_mac <- AddModuleScore_UCell(multiome_mac, features = go_symbols,
+                                     chunk.size = 8000, ncores = n_cores, name = "")
+for (i in seq_along(go_sets)) {  # copy each score to a readable metadata column
+  multiome_mac[[go_sets[[i]]]] <- multiome_mac[[names(go_symbols)[i]]][, 1]
+}
+
+p_pathways <- DotPlot(multiome_mac, group.by = "MacState", features = rev(unname(go_sets)),
+                      scale.min = 0, scale.max = 50) +
   coord_flip() +
-  scale_x_discrete(labels = function(x) parse(text = paste0("italic('", x, "')"))) + NoLegend()
+  scale_color_viridis_c() +
+  guides(size = "none") +
+  labs(color = "Score", x = NULL, y = NULL) +
+  RotatedAxis()
+save_plot(p_pathways, "fig2C_macrophage_pathways.pdf", width = 13, height = 9)
 
-ggsave(filename = file.path(path, 'macrophage_dotplot.pdf'),
-       scale = 0.5, width = 11, height = 20, units='cm')
+
+# ==============================================================================
+# Panel D - Macrophage marker gene dot plot
+# ==============================================================================
+
+p_markers <- DotPlot(
+  multiome_mac, group.by = "MacState",
+  features = rev(c("CCL2", "CCL3", "CCL4", "CCL8", "CD274", "CXCL9", "CXCL10", "IL1B", "TNFRSF4")),
+  scale.min = 0, cols = c("grey90", "navy")
+) +
+  coord_flip() +
+  scale_x_discrete(labels = italic_labels) +
+  labs(x = NULL, y = NULL) +
+  theme(legend.title = element_blank()) +
+  RotatedAxis()
+save_plot(p_markers, "fig2D_macrophage_markers.pdf", width = 8, height = 9)
 
 
-# Figure 2f - Macrophage dotplot of enriched GO terms
-counts <- read.csv(file.path(path, "mac_bulkRNA_counts.csv"))
-rownames(counts) <- counts$X; counts$X <- NULL
-colnames(counts) <- c("1a", "1b", "2a", "2b", "3a", "3b", "4a", "4b", "5a", "5b")
-sample_sheet <- data.frame(names = c("1a.tab", "1b.tab", "2a.tab", "2b.tab", 
-                                            "3a.tab", "3b.tab", "4a.tab", "4b.tab", "5a.tab", "5b.tab"), 
-                                  donor = c("M1_1", "M1_1", "M1_2", "M1_2", "M1_3", "M1_3", 
-                                            "M1_4", "M1_4", "M1_5", "M1_5"), 
-                                  celltype = c("Macrophage", "Macrophage", "Macrophage", "Macrophage", "Macrophage", "Macrophage", 
-                                               "Macrophage", "Macrophage", "Macrophage", "Macrophage"), 
-                                  condition = c("NIR_RPTEC", "IR_RPTEC", "NIR_RPTEC", "IR_RPTEC", 
-                                                "NIR_RPTEC", "IR_RPTEC", "NIR_RPTEC", "IR_RPTEC", "NIR_RPTEC", 
-                                                "IR_RPTEC"))
+# ==============================================================================
+# Panel F - GO enrichment (bulk RNA-seq, macrophages +/- SC CM)
+# ==============================================================================
 
-dds <- DESeqDataSetFromMatrix(countData = counts,
-                              colData = sample_sheet,
-                              design = ~ condition+donor)
-dds <- dds[rowSums(counts(dds)) >= 10,]
+# --- Load counts (first column = gene ID) ---
+counts <- read.csv(path_mac_bulk_counts, check.names = FALSE)
+rownames(counts) <- counts[[1]]
+counts <- counts[, -1, drop = FALSE]
+stopifnot("non-numeric columns in count matrix" = all(vapply(counts, is.numeric, logical(1))),
+          "expected 10 samples"                 = ncol(counts) == 10)
+
+# Assumes the file's columns are in this order (a = control, b = SC CM, per donor)
+sample_ids <- c("1a", "1b", "2a", "2b", "3a", "3b", "4a", "4b", "5a", "5b")
+colnames(counts) <- sample_ids
+
+sample_sheet <- data.frame(
+  donor     = rep(paste0("M1_", 1:5), each = 2),
+  celltype  = "Macrophage",
+  condition = rep(c("NIR_RPTEC", "IR_RPTEC"), 5),  # NIR = control, IR = SC CM
+  row.names = sample_ids
+)
+
+# --- DESeq2 ---
+dds <- DESeqDataSetFromMatrix(countData = counts, colData = sample_sheet,
+                              design = ~ condition + donor)
+dds <- dds[rowSums(counts(dds)) >= 10, ]
 dds <- DESeq(dds)
-vsd <- vst(dds, blind=FALSE)
+vsd <- vst(dds, blind = FALSE)
 
-# Process DE results
-resLFC <- lfcShrink(dds, coef=resultsNames(dds)[2], type="apeglm")
-resLFC <- as.data.frame(resLFC)
-resLFC$gene_id <- sub("\\..*", "", rownames(resLFC))
+# Condition levels sort alphabetically (IR_RPTEC, NIR_RPTEC), so coefficient 2 is
+# NIR vs IR. The sign is flipped below so that positive = higher with SC CM.
+stopifnot(resultsNames(dds)[2] == "condition_NIR_RPTEC_vs_IR_RPTEC")
+de <- as.data.frame(lfcShrink(dds, coef = resultsNames(dds)[2], type = "apeglm"))
+de <- cbind(annotate_ensembl(rownames(de)), de)
+de$log2FoldChange <- -de$log2FoldChange
+write.csv(de, file.path(outdir, "suppl_macrophage_bulk_DE.csv"), row.names = FALSE)
 
-# Translate gene IDs
-ensembl = useMart("ensembl", dataset = "hsapiens_gene_ensembl")
-genemap <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol", "entrezgene_id"), filters = "ensembl_gene_id", 
-                 values = resLFC$gene_id, mart = ensembl) 
-resLFC <- merge(resLFC, genemap, by.x="gene_id", by.y="ensembl_gene_id")
+# --- Genes induced by SC CM (log2FC > 0.5, padj < 0.05) ---
+de_up <- de[!is.na(de$padj) & de$padj < 0.05 & de$log2FoldChange > 0.5, ]
+universe_entrez <- unique(stats::na.omit(de$entrez))
 
-# Subset by LFC
-resLFC_subset <- resLFC[resLFC$log2FoldChange<(-0.5) & resLFC$padj<0.05,]
+ego <- enrichGO(
+  gene = unique(stats::na.omit(de_up$entrez)), universe = universe_entrez,
+  OrgDb = org.Hs.eg.db, ont = "BP", pAdjustMethod = "BH",
+  pvalueCutoff = 0.2, qvalueCutoff = 0.2, readable = TRUE
+)
+write.csv(ego@result, file.path(outdir, "suppl_macrophage_go_enrichment.csv"), row.names = FALSE)
 
-# Prepare query genes
-geneList = resLFC_subset$log2FoldChange
-names(geneList) = as.character(resLFC_subset$entrezgene_id)
-geneList = sort(geneList, decreasing = TRUE)
-geneList <- geneList[!is.na(names(geneList))]
-geneList <- geneList[!duplicated(names(geneList))]
-universe <- as.character(resLFC$entrezgene_id)
+# --- GO terms shown in the figure ---
+go_plot_ids <- c("GO:0001819", "GO:0019221", "GO:0034341", "GO:0050900",
+                 "GO:0050727", "GO:0045088", "GO:0071356", "GO:0022409")
+missing_go <- setdiff(go_plot_ids, ego@result$ID)
+if (length(missing_go) > 0) stop("GO terms not enriched: ", paste(missing_go, collapse = ", "))
 
-ego <- enrichGO(gene          = names(geneList),
-                universe      = universe,
-                OrgDb         = org.Hs.eg.db,
-                ont           = "BP",
-                pAdjustMethod = "BH",
-                pvalueCutoff  = 0.2,
-                qvalueCutoff  = 0.2,
-                readable      = TRUE)
+go_plot <- ego@result[ego@result$ID %in% go_plot_ids, ]
+go_plot$GeneRatio_numeric <- vapply(strsplit(go_plot$GeneRatio, "/"),
+                                    function(x) as.numeric(x[1]) / as.numeric(x[2]), numeric(1))
 
-
-results <- ego@result
-results_subset <- results[results$ID%in%c('GO:0001819', 'GO:0019221', 'GO:0034341', 'GO:0050900', 'GO:0050727', 'GO:0045088', 'GO:0071356', 'GO:0022409'),]
-results_subset <- results_subset[order(results_subset$FoldEnrichment, decreasing = T),]
-results_subset$GeneRatio_numeric <- sapply(strsplit(results_subset$GeneRatio, "/"), function(x) as.numeric(x[1]) / as.numeric(x[2]))
-
-max_count <- max(results_subset$Count, na.rm = TRUE)
-
-# Plot
-ggplot(results_subset, aes(x = GeneRatio_numeric, y = reorder(Description, GeneRatio_numeric))) +
+p_go <- ggplot(go_plot, aes(x = GeneRatio_numeric, y = reorder(Description, GeneRatio_numeric))) +
   geom_point(aes(size = Count, color = p.adjust)) +
-  scale_color_viridis(option = "D", direction = -1, name = "Adjusted p-value") +
-  scale_size_continuous(name = "Gene Count", limits = c(0, max_count)) +
-  labs(x = "Gene Ratio", y = "GO Term", title = "GO Term Enrichment") +
+  scale_color_viridis_c(option = "D", direction = -1, name = "Adjusted p-value") +
+  scale_size_continuous(name = "Gene Count", limits = c(0, max(go_plot$Count))) +
+  labs(x = "Gene Ratio", y = NULL) +
   theme_classic(base_size = 12) +
   theme(
-    axis.text.y = element_text(size = 10, color = "black"),
-    axis.text.x = element_text(color = "black"),
-    axis.title = element_text(color = "black"),
-    plot.title = element_text(hjust = 0.5, color = "black"),
-    legend.text = element_text(color = "black"),
+    axis.text.y  = element_text(size = 10, color = "black"),
+    axis.text.x  = element_text(color = "black"),
+    axis.title   = element_text(color = "black"),
+    legend.text  = element_text(color = "black"),
     legend.title = element_text(color = "black")
   )
-
-ggsave(filename = file.path(path, 'macrophage_go_terms.pdf'),
-       scale = 0.5, width = 34, height = 20, units='cm')
+save_plot(p_go, "fig2F_macrophage_go_terms.pdf", width = 17, height = 10)
 
 
-# Figure 2g - Macrophage heatmap of selected genes
-# Extract count matrix
-matrix <- as.data.frame(assay(vsd))
-matrix$gene_id <- sub("\\..*", "", rownames(matrix))
+# ==============================================================================
+# Panel G - Heatmap of selected genes (bulk RNA-seq)
+# ==============================================================================
 
-ensembl = useMart("ensembl", dataset = "hsapiens_gene_ensembl")
-genemap <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"), filters = "ensembl_gene_id", 
-                 values = matrix$gene_id, mart = ensembl) 
-matrix <- merge(matrix, genemap, by.x="gene_id", by.y="ensembl_gene_id")
-rownames(matrix) <- make.unique(matrix$hgnc_symbol)
-matrix$hgnc_symbol <- NULL
-matrix$gene_id <- NULL
-colnames(matrix) <- sub('\\.', '-', colnames(matrix))
+# --- VST matrix with gene symbols as row names ---
+vsd_mat <- assay(vsd)
+vsd_ann <- annotate_ensembl(rownames(vsd_mat))
+keep    <- !is.na(vsd_ann$symbol)
+vsd_mat <- vsd_mat[keep, ]
+rownames(vsd_mat) <- make.unique(vsd_ann$symbol[keep])
 
-# Prepare plot
-genes <- c('MERTK', 'CD163', 'CABLES1', 'CDKN1C', 'PDK4', 'ADAMTS15', 'MS4A6A', 'CEACAM4', 'THBS1', 'THBS1-IT1',
-           'CD80', 'VCAM1', 'ICAM1', 'IRF8', 'CD83', 'CD58', 'CD44', 'CCL1', 'CCL2', 'CCL3', 'CCL3L3', 'CCL4', 'CCL8', 'CD274', 'CXCL9', 'CXCL10', 
-           'IL1B', 'IL6', 'IL12B', 'IL17A', 'IL17F', 'TNF', 'TNFSF15', 'TNFRSF4',
-           'TGFB1', 'CSF2', 'CLEC5A', 'EDN1', 'HSD11B1', 'SERPINE1', 'SIMALR')
+# --- Genes of interest: first block = homeostatic / resident, second = inflammatory ---
+heatmap_genes <- c(
+  "MERTK", "CD163", "CABLES1", "CDKN1C", "PDK4", "ADAMTS15", "MS4A6A", "CEACAM4", "THBS1", "THBS1-IT1",
+  "CD80", "VCAM1", "ICAM1", "IRF8", "CD83", "CD58", "CD44", "CCL1", "CCL2", "CCL3", "CCL3L3", "CCL4", "CCL8",
+  "CD274", "CXCL9", "CXCL10", "IL1B", "IL6", "IL12B", "IL17A", "IL17F", "TNF", "TNFSF15", "TNFRSF4",
+  "TGFB1", "CSF2", "CLEC5A", "EDN1", "HSD11B1", "SERPINE1", "SIMALR"
+)
+missing_genes <- setdiff(heatmap_genes, rownames(vsd_mat))
+if (length(missing_genes) > 0) {
+  stop("Genes not found after ID mapping: ", paste(missing_genes, collapse = ", "),
+       ". Likely a symbol difference between org.Hs.eg.db and Ensembl (e.g. lncRNAs).")
+}
 
-select <- is.element(rownames(matrix), genes)
-matrix_subset <- matrix[select,]
-matrix_subset <- matrix_subset[genes, c(1, 3, 5, 7, 9, 2, 4, 6, 8, 10), drop = FALSE]
+col_order   <- c(paste0(1:5, "a"), paste0(1:5, "b"))  # controls first, then SC CM
+heat_mat    <- vsd_mat[heatmap_genes, col_order]
 
-col_data <- data.frame(Condition=c(rep('NIR_RPTEC', 5), rep('IR_RPTEC', 5)))
-rownames(col_data) <- c("1a", "2a", "3a", "4a", "5a", "1b", "2b", "3b", "4b", "5b")
-cols <- brewer.pal(9, "BuPu")
-col_list <- brewer.pal(10, "Paired")
-annotation_colors = list(Condition = c('IR_RPTEC'='navy', 'NIR_RPTEC'='grey80'))
+annot_col <- data.frame(Condition = rep(c("Control", "SC CM"), each = 5), row.names = col_order)
+annot_colors <- list(Condition = c("SC CM" = "navy", "Control" = "grey80"))
 
-# Plot
-pheatmap(matrix_subset, cluster_rows=F, cluster_cols=F, show_rownames=T, show_colnames=T, 
-         color=cols, 
-         clustering_method="ward.D2",
-         scale="row", 
-         annotation_col=col_data, 
-         fontsize_row=12, 
-         annotation_colors = annotation_colors,
-         labels_row = parse(text = paste0("italic('", rownames(matrix_subset), "')")),
-         gaps_col = 5, gaps_row = 10)
+pheatmap(
+  heat_mat,
+  scale             = "row",
+  color             = brewer.pal(9, "BuPu"),
+  cluster_rows      = FALSE,
+  cluster_cols      = FALSE,
+  show_rownames     = TRUE,
+  show_colnames     = FALSE,
+  annotation_col    = annot_col,
+  annotation_colors = annot_colors,
+  annotation_legend = FALSE,
+  fontsize_row      = 12,
+  labels_row        = italic_labels(rownames(heat_mat)),
+  gaps_col          = 5,
+  gaps_row          = 10,
+  filename          = file.path(outdir, "fig2G_heatmap_bulk.pdf"),
+  width             = 5,
+  height            = 10
+)
 
 
-# Figure 2h - Projection of bulk signature onto sn data
-# Score signature
-resLFC_subset <- resLFC[resLFC$log2FoldChange<(-0.5) & resLFC$padj<0.05,]
-multiome_mac <- AddModuleScore_UCell(multiome_mac, features = list('upregulated'= resLFC_subset$hgnc_symbol),
-                                    chunk.size = 8000, ncores = 10, name='', maxRank=3000)
+# ==============================================================================
+# Panel H - Bulk-derived signature projected onto single-nucleus macrophages
+# ==============================================================================
 
-# Plot
-VlnPlot(multiome_mac, features = "upregulated", pt.size = 0) +
-  scale_fill_manual(values = c("A" = "#00BFC4", "B" = "#F8766D", "C" = "#7CAE00", "D" = "#C77CFF")) +
+sc_cm_signature <- unique(stats::na.omit(de_up$symbol))
+multiome_mac <- AddModuleScore_UCell(
+  multiome_mac, features = list(SC_CM_signature = sc_cm_signature),
+  chunk.size = 8000, ncores = n_cores, name = "", maxRank = 3000
+)
+
+p_vln <- VlnPlot(multiome_mac, features = "SC_CM_signature", group.by = "MacState", pt.size = 0) +
+  scale_fill_manual(values = mac_colors) +
+  labs(title = NULL, x = NULL, y = "Signature scores") +
   NoLegend()
-
-ggsave(filename = file.path(path, 'signature_violin.pdf'),
-       scale = 0.5, width = 13, height = 20, units='cm')
-
-
-
-# Figure 2l - Macrophage MERTK expression
-Idents(multiome_mac) <- factor(Idents(multiome_mac), levels=rev((c('A', 'B', 'C', 'D'))))
-DotPlot(multiome_mac, 
-        features = 'MERTK', 
-        scale.min = 0, 
-        cols = c('grey90', 'navy')) + 
-  NoLegend() + 
-  RotatedAxis() +
-  scale_x_discrete(labels = function(x) parse(text = paste0("italic('", x, "')")))
-
-ggsave(filename = file.path(path, 'dotplot_mertk.pdf'),
-       scale = 0.5, width = 8, height = 14, units='cm')
-
-
-
-DotPlot(multiome_mac, 
-        features = c('CD36', 'LYVE1', 'RNASE1', 'NFKBIZ', 'CCL8', 'F13A1', 'CCL2', 'CD80',
-                     'MAF', 'CD209', 'MRC1', 'CXCL10', 'CCL4', 'CD274', 'CXCL9', 'IRF1', 'NFKB1', 'CCL21', 
-                     'ICAM1', 'CCL3', 'CD44', 'CD58', 'VCAM1', 'IL1B', 'CD83', 'IRF8', 'APOE', 'SELENOP', 
-                     'CD163', 'CD38', 'MMP9', 'CXCL12', 'PLAU', 'C1QA', 'MERTK'), 
-        scale.min = 0, 
-        cols = c('grey90', 'navy')) + 
-  NoLegend() + 
-  RotatedAxis() +
-  scale_x_discrete(labels = function(x) parse(text = paste0("italic('", x, "')")))
-
+save_plot(p_vln, "fig2H_signature_violin.pdf", width = 6.5, height = 10)
 

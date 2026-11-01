@@ -1,47 +1,75 @@
-library(Seurat)
-library(Signac)
-library(SeuratObject)
-library(SeuratDisk)
-library(SeuratWrappers)
-library(scCustomize)
-library(UCell)
-library(harmony)
-library(CellChat)
-library(destiny)
-library(DESeq2)
-library(clusterProfiler)
-library(EnhancedVolcano)
-library(ggplot2)
-library(ggsci)
-library(destiny)
-library(scales)
-library(viridis)
-library(nichenetr)
-library(biomaRt)
-library(pheatmap)
-library(RColorBrewer)
-library(org.Hs.eg.db)
+# ==============================================================================
+# Supplementary Figure 2
+#   A  Average expression of macrophage marker genes per macrophage state,
+#      z-scored per gene, with hierarchical clustering of states and genes
+#
+# Input from the Figure 2 script:
+#   multiome_mac
+# ==============================================================================
 
-multiome <- readRDS('/Users/maximilianreck/Drive/Datasets/seurat_object_multiome.rds')
-#-------------------------------------------------------------------------------
 
-# Figure S2a - Heatmap of macrophage markers
-# Average expression across clusters
-Idents(multiome_mac) <- multiome_mac$Cluster
-average_expr <- AverageExpression(multiome_mac)
-average_expr <- as.data.frame(average_expr$SCT)
+# ------------------------------------------------------------------------------
+# Libraries
+# ------------------------------------------------------------------------------
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(pheatmap)
+  library(RColorBrewer)
+})
 
-average_expr <- average_expr[rownames(average_expr)%in%c('IL6' 'CD36', 'LYVE1', 'RNASE1', 'NFKBIZ', 'CCL8', 'F13A1', 'CCL2', 'CD80',
-                                                         'MAF', 'CD209', 'MRC1', 'CXCL10', 'CCL4', 'CD274', 'CXCL9', 'IRF1', 'NFKB1', 'CCL21', 
-                                                         'ICAM1', 'CCL3', 'CD44', 'CD58', 'VCAM1', 'IL1B', 'CD83', 'IRF8', 'APOE', 'SELENOP', 
-                                                         'CD163', 'CD38', 'MMP9', 'CXCL12', 'PLAU', 'C1QA', 'MERTK', 'CD206'),]
 
-# Plot
-pheatmap(t(average_expr), cluster_rows=T, cluster_cols=T, show_rownames=T, show_colnames=T,
-         color=cols, 
-         clustering_method="ward.D2",
-         scale="column", 
-         fontsize_row=12, 
-         labels_col = parse(text = paste0("italic('", rownames(average_expr), "')")))
-         gaps_col = 5, gaps_row = 9)
+# ------------------------------------------------------------------------------
+# Paths and settings
+# ------------------------------------------------------------------------------
+outdir <- path.expand("~/Desktop/out/figS2")
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
 
+# Italic gene labels for pheatmap
+italic_labels <- function(x) parse(text = paste0("italic('", x, "')"))
+
+mac_levels <- c("Phago Mac", "Infl Mac", "Endo Mac", "Res Mac")
+
+
+# ==============================================================================
+# Panel A - Heatmap of macrophage markers
+# ==============================================================================
+# --- Average expression per macrophage state ---
+avg <- as.matrix(AverageExpression(multiome_mac, assays = "SCT", group.by = "MacState")$SCT)
+
+# Seurat can alter spaces / underscores in group names, so match them loosely
+name_key <- function(x) gsub("[^A-Za-z]", "", x)
+idx <- match(name_key(mac_levels), name_key(colnames(avg)))
+stopifnot("macrophage states not found in AverageExpression output" = !anyNA(idx))
+avg <- avg[, idx]
+colnames(avg) <- gsub(" ", "-", mac_levels)  # the figure writes e.g. "Infl-Mac"
+
+# --- Marker genes ---
+marker_genes <- c(
+  "CD36", "LYVE1", "RNASE1", "NFKBIZ", "CCL8", "F13A1", "CCL2", "CD80",
+  "MAF", "CD209", "MRC1", "CXCL10", "CCL4", "CD274", "CXCL9", "IRF1", "NFKB1", "CCL21",
+  "ICAM1", "CCL3", "CD44", "CD58", "VCAM1", "IL1B", "CD83", "IRF8", "APOE", "SELENOP",
+  "CD163", "CD38", "MMP9", "CXCL12", "PLAU", "C1QA", "MERTK", "IL6"
+)
+missing_genes <- setdiff(marker_genes, rownames(avg))
+if (length(missing_genes) > 0) {
+  message("Not in the SCT assay, omitted from the heatmap: ", paste(missing_genes, collapse = ", "))
+}
+heat_mat <- t(avg[intersect(marker_genes, rownames(avg)), , drop = FALSE])  # states x genes
+
+# --- Plot (z-score per gene across states, then cluster both axes) ---
+pheatmap(
+  heat_mat,
+  scale             = "column",
+  color             = brewer.pal(9, "BuPu"),
+  clustering_method = "ward.D2",
+  cluster_rows      = TRUE,
+  cluster_cols      = TRUE,
+  show_rownames     = TRUE,
+  show_colnames     = TRUE,
+  fontsize_row      = 12,
+  fontsize_col      = 12,
+  labels_col        = italic_labels(colnames(heat_mat)),
+  filename          = file.path(outdir, "figS2A_macrophage_marker_heatmap.pdf"),
+  width             = 12,
+  height            = 4.6
+)
